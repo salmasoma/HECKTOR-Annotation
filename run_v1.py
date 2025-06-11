@@ -3,121 +3,19 @@ import glob
 import re
 import numpy as np
 import napari
+from napari.layers import Image, Labels
 import SimpleITK as sitk
 from PyQt5.QtWidgets import (QPushButton, QVBoxLayout, QWidget, QHBoxLayout, 
                             QComboBox, QLabel, QMessageBox, QSlider, QSpinBox,
-                            QProgressBar, QDialog, QLineEdit, QDialogButtonBox,
-                            QApplication)
+                            QProgressBar)
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QPixmap, QFont
+from PyQt5.QtGui import QPixmap
 from scipy import ndimage
-from skimage import morphology
+from skimage import morphology, segmentation
 from skimage.filters import gaussian
-import argparse
-import sys
-
-# ADD THIS FUNCTION at the top, before your existing classes
-def parse_args():
-    """Parse command line arguments for web interface integration"""
-    parser = argparse.ArgumentParser(description="HECKTOR Viewer")
-    parser.add_argument('--data', type=str, default="./test/", help="Data folder path")
-    parser.add_argument('--patient', type=str, help="Specific patient to load")
-    parser.add_argument('--annotator', type=str, help="Annotator ID")
-    return parser.parse_args()
-
-class AnnotatorLoginDialog(QDialog):
-    def __init__(self):
-        super().__init__()
-        self.annotator_id = None
-        self.init_ui()
-    
-    def init_ui(self):
-        self.setWindowTitle("HECKTOR Annotator Login")
-        self.setModal(True)
-        self.setFixedSize(400, 200)
-        
-        layout = QVBoxLayout()
-        
-        # Title
-        title_label = QLabel("HECKTOR Segmentation Tool")
-        title_font = QFont()
-        title_font.setPointSize(16)
-        title_font.setBold(True)
-        title_label.setFont(title_font)
-        title_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(title_label)
-        
-        # Instructions
-        instruction_label = QLabel("Please enter your annotator ID to continue:")
-        instruction_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(instruction_label)
-        
-        # ID input
-        id_layout = QHBoxLayout()
-        id_layout.addWidget(QLabel("Annotator ID:"))
-        
-        self.id_input = QLineEdit()
-        self.id_input.setPlaceholderText("e.g., 01, initials, etc.")
-        self.id_input.textChanged.connect(self.validate_input)
-        self.id_input.returnPressed.connect(self.accept_login)
-        id_layout.addWidget(self.id_input)
-        
-        layout.addLayout(id_layout)
-        
-        # Guidelines
-        guidelines_label = QLabel(
-            "Guidelines:\n"
-            "• Use a unique, identifiable ID\n"
-            "• Avoid spaces (use underscores instead)\n"
-        )
-        guidelines_label.setStyleSheet("color: #666; font-size: 10px;")
-        layout.addWidget(guidelines_label)
-        
-        # Buttons
-        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.ok_button = button_box.button(QDialogButtonBox.Ok)
-        self.ok_button.setText("Start Annotation")
-        self.ok_button.setEnabled(False)
-        
-        button_box.accepted.connect(self.accept_login)
-        button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
-        
-        self.setLayout(layout)
-        
-        # Focus on input field
-        self.id_input.setFocus()
-    
-    def validate_input(self):
-        """Enable OK button only if valid ID is entered"""
-        text = self.id_input.text().strip()
-        # Basic validation: not empty, no spaces, reasonable length
-        is_valid = (len(text) >= 2 and 
-                   ' ' not in text and 
-                   len(text) <= 50 and
-                   text.replace('_', '').replace('-', '').isalnum())
-        
-        self.ok_button.setEnabled(is_valid)
-        
-        # Visual feedback
-        if text and not is_valid:
-            self.id_input.setStyleSheet("border: 2px solid red;")
-        else:
-            self.id_input.setStyleSheet("")
-    
-    def accept_login(self):
-        """Accept the login if ID is valid"""
-        if self.ok_button.isEnabled():
-            self.annotator_id = self.id_input.text().strip()
-            self.accept()
-    
-    def get_annotator_id(self):
-        """Get the entered annotator ID"""
-        return self.annotator_id
-
 
 class HECKTORViewer:
-    def __init__(self, data_folder, annotator_id, finals_folder=None, logo_path=None):
+    def __init__(self, data_folder, finals_folder=None, logo_path=None):
         """
         Initialize the HECKTOR dataset viewer
         
@@ -125,8 +23,6 @@ class HECKTORViewer:
         -----------
         data_folder : str
             Path to the folder containing all scans
-        annotator_id : str
-            ID of the current annotator
         finals_folder : str, optional
             Path to save the edited masks
         logo_path : str, optional
@@ -135,7 +31,6 @@ class HECKTORViewer:
         self.data_folder = data_folder
         self.labels_folder = os.path.join(data_folder, "labels")
         self.logo_path = logo_path
-        self.annotator_id = annotator_id
         
         # Create finals folder if it doesn't exist
         if finals_folder is None:
@@ -150,14 +45,11 @@ class HECKTORViewer:
         self.patients = self._get_patients()
         self.current_patient_idx = -1  # No patient loaded initially
         
-        # Track completed patients (by this annotator)
+        # Track completed patients
         self.completed_patients = self._get_completed_patients()
         
-        # Initialize napari viewer with bottom controls always visible
-        self.viewer = napari.Viewer(title=f"HECKTOR Segmentation Editor - Annotator: {self.annotator_id}")
-        
-        # Ensure bottom controls (slice slider) remain visible in fullscreen
-        self._ensure_controls_visible()
+        # Initialize napari viewer
+        self.viewer = napari.Viewer(title="HECKTOR Segmentation Editor")
         
         # Add custom UI widgets
         self._create_ui()
@@ -172,7 +64,7 @@ class HECKTORViewer:
             
         # Show instructions
         print("=" * 80)
-        print(f"HECKTOR SEGMENTATION - ANNOTATOR: {self.annotator_id}")
+        print("HECKTOR SEGMENTATION WITH CLINICAL PROTOCOL")
         print("=" * 80)
         print("LABEL 1 - PRIMARY TUMOR (GTVp):")
         print("• Include entire morphologic anomaly (CT) + hypermetabolic volume (PET)")
@@ -187,29 +79,7 @@ class HECKTORViewer:
         print("\nWORKFLOW:")
         print("1. Review CT morphology + PET uptake")
         print("2. Segment key slices → Smart Interpolate → Clean Up → Save")
-        print(f"\nSaved files will include your ID: patient_id_{self.annotator_id}.nii.gz")
         print("=" * 80)
-
-    def _ensure_controls_visible(self):
-        """Ensure napari's built-in controls (including slice slider) remain visible in fullscreen"""
-        # Access the Qt window
-        qt_window = self.viewer.window._qt_window
-        
-        # Force the dims widget (which contains the slice slider) to always be visible
-        dims_widget = self.viewer.window._qt_viewer.dims
-        dims_widget.setVisible(True)
-        
-        # Set minimum height for the main window to ensure bottom controls don't get cut off
-        qt_window.setMinimumHeight(600)
-        
-        # Ensure the status bar is visible (contains slice info)
-        if hasattr(qt_window, 'statusBar'):
-            qt_window.statusBar().setVisible(True)
-        
-        # Force layout update
-        qt_window.adjustSize()
-        
-        print("Napari controls visibility ensured for fullscreen mode")
     
     def _get_patients(self):
         """Get list of patient IDs from the data folder, ordered by completion status"""
@@ -229,7 +99,7 @@ class HECKTORViewer:
                 if os.path.exists(pt_file):
                     patient_ids.append(patient_id)
         
-        # Get completed patients (by this annotator)
+        # Get completed patients
         completed_patients = self._get_completed_patients_static()
         
         # Separate completed and incomplete patients
@@ -243,47 +113,41 @@ class HECKTORViewer:
         return incomplete_patients + complete_patients
     
     def _get_completed_patients_static(self):
-        """Static method to get completed patients by this annotator"""
+        """Static method to get completed patients without relying on instance variables"""
         finals_folder = os.path.join(os.path.dirname(self.data_folder), "finals")
         if not os.path.exists(finals_folder):
             return set()
         
-        # Look for files with this annotator's ID
-        pattern = f"*_{self.annotator_id}.nii.gz"
-        completed_files = glob.glob(os.path.join(finals_folder, pattern))
+        completed_files = glob.glob(os.path.join(finals_folder, "*.nii.gz"))
         completed_ids = set()
         
         for file_path in completed_files:
-            # Extract patient ID from filename (remove _annotator_id.nii.gz)
-            filename = os.path.basename(file_path)
-            patient_id = filename.replace(f'_{self.annotator_id}.nii.gz', '')
+            # Extract patient ID from filename (remove .nii.gz extension)
+            patient_id = os.path.basename(file_path).replace('.nii.gz', '')
             completed_ids.add(patient_id)
         
         return completed_ids
     
     def _get_completed_patients(self):
-        """Get list of completed patients by this annotator"""
+        """Get list of completed patients from finals folder"""
         if not os.path.exists(self.finals_folder):
             return set()
         
-        # Look for files with this annotator's ID
-        pattern = f"*_{self.annotator_id}.nii.gz"
-        completed_files = glob.glob(os.path.join(self.finals_folder, pattern))
+        completed_files = glob.glob(os.path.join(self.finals_folder, "*.nii.gz"))
         completed_ids = set()
         
         for file_path in completed_files:
-            # Extract patient ID from filename (remove _annotator_id.nii.gz)
-            filename = os.path.basename(file_path)
-            patient_id = filename.replace(f'_{self.annotator_id}.nii.gz', '')
+            # Extract patient ID from filename (remove .nii.gz extension)
+            patient_id = os.path.basename(file_path).replace('.nii.gz', '')
             completed_ids.add(patient_id)
         
         return completed_ids
     
     def _update_progress_bar(self):
-        """Update the progress bar based on completed patients by this annotator"""
+        """Update the progress bar based on completed patients"""
         if not self.patients:
             self.progress_bar.setValue(0)
-            self.progress_label.setText(f"Progress ({self.annotator_id}): 0/0 (0%)")
+            self.progress_label.setText("Progress: 0/0 (0%)")
             return
         
         completed_count = len(self.completed_patients)
@@ -291,28 +155,13 @@ class HECKTORViewer:
         percentage = int((completed_count / total_count) * 100) if total_count > 0 else 0
         
         self.progress_bar.setValue(percentage)
-        self.progress_label.setText(f"Progress ({self.annotator_id}): {completed_count}/{total_count} ({percentage}%)")
+        self.progress_label.setText(f"Progress: {completed_count}/{total_count} ({percentage}%)")
     
     def _create_ui(self):
         """Create custom UI widgets"""
         # Create a container widget
         container = QWidget()
         layout = QVBoxLayout(container)
-        
-        # Annotator info section
-        annotator_info = QLabel(f"<b>Annotator: {self.annotator_id}</b>")
-        annotator_info.setStyleSheet("""
-            QLabel {
-                background-color: #e3f2fd;
-                color: #1976d2;
-                padding: 4px;
-                border: 2px solid #1976d2;
-                border-radius: 5px;
-                font-size: 10px;
-            }
-        """)
-        annotator_info.setAlignment(Qt.AlignCenter)
-        layout.addWidget(annotator_info)
         
         # Progress Section
         layout.addWidget(QLabel("<b>Progress:</b>"))
@@ -335,7 +184,7 @@ class HECKTORViewer:
         layout.addWidget(self.progress_bar)
         
         # Progress label
-        self.progress_label = QLabel(f"Progress ({self.annotator_id}): 0/0 (0%)")
+        self.progress_label = QLabel("Progress: 0/0 (0%)")
         self.progress_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.progress_label)
         
@@ -382,8 +231,6 @@ class HECKTORViewer:
         nav_layout.addWidget(self.next_btn)
         nav_layout.addWidget(self.save_btn)
         layout.addLayout(nav_layout)
-        
-
         
         # Drawing tools section
         layout.addWidget(QLabel("<b>Drawing Tools:</b>"))
@@ -478,7 +325,7 @@ class HECKTORViewer:
             "4. Use 'Smart Interpolate' to fill gaps\n"
             "5. Use 'Clean Up' to refine results\n"
             "6. Verify separation between GTVp and GTVn\n"
-            f"7. Save final segmentation (saves as: patient_{self.annotator_id}.nii.gz)"
+            "7. Save final segmentation"
         )
         
         instructions_label = QLabel(instructions_text)
@@ -487,7 +334,7 @@ class HECKTORViewer:
             "QLabel { "
             "background-color: #f0f8ff; "
             "color: #333333; "
-            "padding: 6px; "
+            "padding: 8px; "
             "border: 1px solid #cccccc; "
             "border-radius: 5px; "
             "font-size: 11px; "
@@ -504,24 +351,22 @@ class HECKTORViewer:
             logo_label = QLabel()
             logo_pixmap = QPixmap(self.logo_path)
             # Scale logo to reasonable size (max 150px width for bottom placement)
-            if logo_pixmap.width() > 250:
-                logo_pixmap = logo_pixmap.scaledToWidth(250, Qt.SmoothTransformation)
+            if logo_pixmap.width() > 300:
+                logo_pixmap = logo_pixmap.scaledToWidth(300, Qt.SmoothTransformation)
             logo_label.setPixmap(logo_pixmap)
             logo_label.setAlignment(Qt.AlignCenter)
             logo_label.setStyleSheet(
                 "QLabel { "
-                "margin-top: 5px; "
+                "margin-top: 10px; "
                 "margin-bottom: 5px; "
                 "border-top: 1px solid #cccccc; "
-                "padding-top: 8px; "
+                "padding-top: 10px; "
                 "}"
             )
             layout.addWidget(logo_label)
         
         # Add the container to the viewer
         self.viewer.window.add_dock_widget(container, name="HECKTOR Tools", area="right")
-    
-
     
     def _on_patient_selected(self, index):
         """Handle patient selection from dropdown"""
@@ -534,7 +379,7 @@ class HECKTORViewer:
         if self.current_patient_idx >= 0 and self.current_patient_idx < len(self.patients):
             patient_id = self.patients[self.current_patient_idx]
             
-            # Check if patient is completed by this annotator
+            # Check if patient is completed
             completion_status = " ✓" if patient_id in self.completed_patients else ""
             self.patient_label.setText(f"Current Patient: {patient_id}{completion_status}")
             
@@ -861,13 +706,13 @@ class HECKTORViewer:
         ct_file = os.path.join(self.data_folder, f"{patient_id}__CT.nii.gz")
         pt_file = os.path.join(self.data_folder, f"{patient_id}__PT.nii.gz")
         
-        # Prioritize mask from finals folder with annotator ID, then fall back to original labels
-        annotator_mask_file = os.path.join(self.finals_folder, f"{patient_id}_{self.annotator_id}.nii.gz")
+        # Prioritize mask from finals folder, then fall back to original labels
+        finals_mask_file = os.path.join(self.finals_folder, f"{patient_id}.nii.gz")
         original_mask_file = os.path.join(self.labels_folder, f"{patient_id}.nii.gz")
         
-        if os.path.exists(annotator_mask_file):
-            mask_file = annotator_mask_file
-            print(f"Loading previous annotation by {self.annotator_id} for patient {patient_id}")
+        if os.path.exists(finals_mask_file):
+            mask_file = finals_mask_file
+            print(f"Loading edited segmentation from finals folder for patient {patient_id}")
         elif os.path.exists(original_mask_file):
             mask_file = original_mask_file
             print(f"Loading original segmentation for patient {patient_id}")
@@ -1020,7 +865,7 @@ class HECKTORViewer:
             self.mask_layer.brush_size = size
     
     def _save_mask(self):
-        """Save the segmentation to the finals folder with annotator ID"""
+        """Save the segmentation to the finals folder"""
         if not hasattr(self, 'mask_layer') or self.current_patient_id is None:
             return
             
@@ -1037,8 +882,8 @@ class HECKTORViewer:
         mask_sitk.SetOrigin(self.ct_origin)
         mask_sitk.SetDirection(self.ct_direction)
         
-        # Save to finals folder with annotator ID in filename
-        output_file = os.path.join(self.finals_folder, f"{self.current_patient_id}_{self.annotator_id}.nii.gz")
+        # Save to finals folder using the same naming pattern as the labels
+        output_file = os.path.join(self.finals_folder, f"{self.current_patient_id}.nii.gz")
         sitk.WriteImage(mask_sitk, output_file)
         
         # Update completed patients and progress bar
@@ -1046,14 +891,12 @@ class HECKTORViewer:
         self._update_progress_bar()
         self._update_patient_info()  # Update to show completion checkmark
         
-        print(f"Saved segmentation for patient {self.current_patient_id} by {self.annotator_id} to {output_file}")
+        print(f"Saved segmentation for patient {self.current_patient_id} to {output_file}")
         
         # Show confirmation message
         QMessageBox.information(self.viewer.window._qt_window, 
                               "Save Successful", 
-                              f"Saved segmentation for patient {self.current_patient_id}\n"
-                              f"File: {self.current_patient_id}_{self.annotator_id}.nii.gz\n"
-                              f"Annotator: {self.annotator_id}")
+                              f"Saved segmentation for patient {self.current_patient_id}")
     
     def _next_patient(self):
         """Load the next patient"""
@@ -1072,63 +915,30 @@ class HECKTORViewer:
         self.load_patient(self.patients[self.current_patient_idx])
 
 
-def get_annotator_id():
-    """Get annotator ID through login dialog"""
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication([])
-    
-    login_dialog = AnnotatorLoginDialog()
-    result = login_dialog.exec_()
-    
-    if result == QDialog.Accepted:
-        return login_dialog.get_annotator_id()
-    else:
-        return None
-
-
 def main():
-    # Parse command line arguments
-    args = parse_args()
+
+    #get data folder from command line argument --data
+    import sys
+    import argparse
+    parser = argparse.ArgumentParser(description="Run HECKTOR Viewer")
+    parser.add_argument('--data', type=str, default="./test/", help="Path to the folder containing patient data")
+    args = parser.parse_args()
     
-    # Use data folder from arguments
+    # Folder with all patient data
     data_folder = args.data
     if not os.path.exists(data_folder):
         print(f"Data folder '{data_folder}' does not exist. Please provide a valid path.")
         sys.exit(1)
     
-    # Optional: Path to logo image
+    # Optional: Path to logo image (e.g., "./logo.png")
     logo_path = "./logo.png"  # Change this to your logo path or set to None
     
-    # Get annotator ID (from web interface or user input)
-    if args.annotator:
-        # Called from web interface with annotator ID
-        annotator_id = args.annotator
-        print(f"Starting annotation session for: {annotator_id}")
-    else:
-        # Called directly - show login dialog
-        print("Starting HECKTOR Annotation Tool...")
-        annotator_id = get_annotator_id()
-        
-        if annotator_id is None:
-            print("Annotation cancelled - no annotator ID provided.")
-            sys.exit(0)
-        
-        print(f"Starting annotation session for: {annotator_id}")
-    
-    # Create the viewer with annotator ID
-    viewer = HECKTORViewer(data_folder, annotator_id, logo_path=logo_path)
-    
-    # If specific patient requested (from web interface), load it
-    if args.patient and args.patient in viewer.patients:
-        patient_index = viewer.patients.index(args.patient)
-        viewer.current_patient_idx = patient_index
-        viewer.load_patient(args.patient)
-        print(f"Loaded patient: {args.patient}")
+    # Create the viewer
+    viewer = HECKTORViewer(data_folder, logo_path=logo_path)
     
     # Start the napari event loop
     napari.run()
 
-# MAKE SURE this is at the very end of your file:
+
 if __name__ == "__main__":
     main()

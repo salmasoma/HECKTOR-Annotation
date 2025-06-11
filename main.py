@@ -92,7 +92,7 @@ class AnnotatorLoginDialog(QDialog):
         """Enable OK button only if valid ID is entered"""
         text = self.id_input.text().strip()
         # Basic validation: not empty, no spaces, reasonable length
-        is_valid = (len(text) >= 2 and 
+        is_valid = (len(text) >= 1 and 
                    ' ' not in text and 
                    len(text) <= 50 and
                    text.replace('_', '').replace('-', '').isalnum())
@@ -292,6 +292,69 @@ class HECKTORViewer:
         
         self.progress_bar.setValue(percentage)
         self.progress_label.setText(f"Progress ({self.annotator_id}): {completed_count}/{total_count} ({percentage}%)")
+    
+    def _has_unsaved_changes(self):
+        """Check if there are unsaved changes in the current patient"""
+        if not hasattr(self, 'mask_layer') or not hasattr(self, 'original_mask'):
+            return False
+        
+        current_mask = self.mask_layer.data
+        return not np.array_equal(current_mask, self.original_mask)
+    
+    def _show_unsaved_changes_dialog(self, action_description="continue"):
+        """Show dialog warning about unsaved changes and return user choice"""
+        if not self._has_unsaved_changes():
+            return "continue"  # No changes, safe to continue
+        
+        msg_box = QMessageBox(self.viewer.window._qt_window)
+        msg_box.setIcon(QMessageBox.Warning)
+        msg_box.setWindowTitle("⚠️ Unsaved Changes Detected")
+        
+        msg_box.setText(
+            f"<b>You have unsaved changes for patient: {self.current_patient_id}</b>"
+        )
+        
+        msg_box.setInformativeText(
+            f"What would you like to do before {action_description}?\n\n"
+            "• Save & Continue: Save current work and proceed\n"
+            "• Discard & Continue: Lose all changes and proceed\n"
+            "• Cancel: Stay with current patient to save manually"
+        )
+        
+        # Create custom buttons
+        save_button = msg_box.addButton("💾 Save & Continue", QMessageBox.AcceptRole)
+        discard_button = msg_box.addButton("🗑️ Discard & Continue", QMessageBox.DestructiveRole)
+        cancel_button = msg_box.addButton("❌ Cancel", QMessageBox.RejectRole)
+        
+        # Set default button to Save (safest option)
+        msg_box.setDefaultButton(save_button)
+        
+        # Execute dialog
+        msg_box.exec_()
+        clicked_button = msg_box.clickedButton()
+        
+        if clicked_button == save_button:
+            # Save current work and continue
+            self._save_mask()
+            return "continue"
+        elif clicked_button == discard_button:
+            # Show additional confirmation for destructive action
+            confirm_discard = QMessageBox.question(
+                self.viewer.window._qt_window,
+                "Confirm Discard Changes",
+                f"⚠️ Are you sure you want to discard all changes for patient {self.current_patient_id}?\n\n"
+                "This action cannot be undone!",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if confirm_discard == QMessageBox.Yes:
+                return "continue"
+            else:
+                return "cancel"
+        else:
+            # Cancel - stay with current patient
+            return "cancel"
     
     def _create_ui(self):
         """Create custom UI widgets"""
@@ -524,10 +587,19 @@ class HECKTORViewer:
 
     
     def _on_patient_selected(self, index):
-        """Handle patient selection from dropdown"""
-        if index >= 0 and index < len(self.patients):
-            self.current_patient_idx = index
-            self.load_patient(self.patients[index])
+        """Handle patient selection from dropdown with unsaved changes check"""
+        if index >= 0 and index < len(self.patients) and index != self.current_patient_idx:
+            # Check for unsaved changes before switching
+            choice = self._show_unsaved_changes_dialog("switching to selected patient")
+            
+            if choice == "continue":
+                self.current_patient_idx = index
+                self.load_patient(self.patients[index])
+            else:
+                # Revert dropdown selection if user cancelled
+                self.patient_combo.blockSignals(True)
+                self.patient_combo.setCurrentIndex(self.current_patient_idx)
+                self.patient_combo.blockSignals(False)
     
     def _update_patient_info(self):
         """Update UI based on currently loaded patient"""
@@ -1041,6 +1113,9 @@ class HECKTORViewer:
         output_file = os.path.join(self.finals_folder, f"{self.current_patient_id}_{self.annotator_id}.nii.gz")
         sitk.WriteImage(mask_sitk, output_file)
         
+        # Update the original mask to reflect the saved state
+        self.original_mask = final_mask.copy()
+        
         # Update completed patients and progress bar
         self.completed_patients.add(self.current_patient_id)
         self._update_progress_bar()
@@ -1056,20 +1131,30 @@ class HECKTORViewer:
                               f"Annotator: {self.annotator_id}")
     
     def _next_patient(self):
-        """Load the next patient"""
+        """Load the next patient with unsaved changes check"""
         if not self.patients:
             return
-            
-        self.current_patient_idx = (self.current_patient_idx + 1) % len(self.patients)
-        self.load_patient(self.patients[self.current_patient_idx])
+        
+        # Check for unsaved changes before moving to next patient
+        choice = self._show_unsaved_changes_dialog("moving to the next patient")
+        
+        if choice == "continue":
+            self.current_patient_idx = (self.current_patient_idx + 1) % len(self.patients)
+            self.load_patient(self.patients[self.current_patient_idx])
+        # If cancelled, stay with current patient
     
     def _prev_patient(self):
-        """Load the previous patient"""
+        """Load the previous patient with unsaved changes check"""
         if not self.patients:
             return
-            
-        self.current_patient_idx = (self.current_patient_idx - 1) % len(self.patients)
-        self.load_patient(self.patients[self.current_patient_idx])
+        
+        # Check for unsaved changes before moving to previous patient
+        choice = self._show_unsaved_changes_dialog("moving to the previous patient")
+        
+        if choice == "continue":
+            self.current_patient_idx = (self.current_patient_idx - 1) % len(self.patients)
+            self.load_patient(self.patients[self.current_patient_idx])
+        # If cancelled, stay with current patient
 
 
 def get_annotator_id():
